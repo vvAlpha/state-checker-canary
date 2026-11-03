@@ -74,8 +74,13 @@ def load(state: State, folder: Path) -> StateResult:
     except OSError:
         outcome = "unknown"
     # From the report's problems, never a stored `ok`, and red if the step was.
-    why = "" if outcome == "success" else f"the check step ended as {outcome} (the report may be partial)"
-    return StateResult(state, report, not report.ok or bool(why), why)
+    # Named only when the report looks clean, as the report's problems say the rest.
+    why = (
+        ""
+        if outcome == "success" or not report.ok
+        else f"the check step ended as {outcome} (the report may be partial)"
+    )
+    return StateResult(state, report, not report.ok or outcome != "success", why)
 
 
 def _cell(text: str) -> str:

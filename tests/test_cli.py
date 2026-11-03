@@ -240,3 +240,9 @@ def test_a_malformed_round_trip_counts_as_failed_and_the_summary_still_renders(t
     result = batch.load(states.get("az"), tmp_path / "az")
     assert result.failed and result.report is None
     assert "AZ Arizona" in batch.summary([result], "t")
+
+
+def test_a_failed_step_with_problems_does_not_repeat_itself(tmp_path):
+    _write(tmp_path / "az", Report("AZ", "Arizona", "t", served=True, problems=["200: wrong"]), outcome="failure")
+    result = batch.load(states.get("az"), tmp_path / "az")
+    assert result.failed and "check step ended" not in result.body
