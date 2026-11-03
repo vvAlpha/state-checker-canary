@@ -1,0 +1,45 @@
+# Lint and test the canary itself on every push and pull request: Python lint,
+# unit tests, the per-state workflows in step with canary/states.py, and the
+# workflows themselves (actionlint for correctness, zizmor for security).
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Lint and test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read # check out this repository
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          version: "0.11.26" # uv itself, pinned too: the action defaults to the latest
+          enable-cache: true
+      - run: uv sync --locked
+      - name: Lint
+        run: |
+          uv run ruff check .
+          uv run ruff format --check .
+      - name: Unit tests
+        run: uv run pytest -q
+      - name: Per-state workflows match canary/states.py
+        run: uv run python -m canary workflows
+      - name: Lint the workflows
+        run: |
+          uv run actionlint
+          uv run zizmor --offline .github/workflows

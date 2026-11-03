@@ -1,0 +1,88 @@
+# The check every state runs, called by its own workflow (state-<code>.yml).
+# The logic is in Python (canary/); this file only runs it and reports:
+#
+#   check ── keep the report ── open/update/close the state's issue ── fail loudly
+#
+# - check: `python -m canary check`. It asks the deployed checker to look up the
+#   state's sample ids live, then reads one answer back from storage. It prints
+#   the summary, writes report.json, and exits 1 on any problem. It may fail
+#   without stopping the job, so the steps after it always report.
+# - The issue step runs only for main (scheduled runs and dispatches from main):
+#   a dispatch from a branch is testing that branch, not the checker's health.
+# - Fail loudly: a red run, an error annotation per problem (printed by the
+#   check), the state's open issue, and GitHub's own failure email.
+name: Check one state
+
+on:
+  workflow_call:
+    inputs:
+      state:
+        description: Two-letter state code, lower case
+        type: string
+        required: true
+      all_cases:
+        description: Check every sample id, not just this run's two
+        type: boolean
+        default: false
+    secrets:
+      CHECKER_BASE_URL:
+        description: The checker's https origin
+        required: true
+
+permissions: {}
+
+jobs:
+  check:
+    name: Check ${{ inputs.state }}
+    runs-on: ubuntu-24.04
+    # The check stops starting lookups after 20 minutes (check.BUDGET_SECONDS), so
+    # a report and the issue update always land before this.
+    timeout-minutes: 30
+    permissions:
+      contents: read # check out this repository
+      issues: write # open, comment on and close the state's issue
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version-file: .python-version
+
+      - name: Check the state through the checker
+        id: check
+        continue-on-error: true
+        # A step timeout fails only this step, so the report, issue and failure
+        # steps still run; a job timeout would cancel them.
+        timeout-minutes: 25
+        env:
+          CHECKER_BASE_URL: ${{ secrets.CHECKER_BASE_URL }}
+          STATE: ${{ inputs.state }}
+          ALL_CASES: ${{ inputs.all_cases }}
+        run: python -m canary check --state "$STATE" --all-cases "$ALL_CASES" --json report.json --summary "$GITHUB_STEP_SUMMARY"
+
+      - name: Keep the report
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: report-${{ inputs.state }}
+          path: report.json
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Open, update or close the state's issue
+        if: ${{ !cancelled() && github.ref == 'refs/heads/main' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          STATE: ${{ inputs.state }}
+          CHECK_OUTCOME: ${{ steps.check.outcome }}
+        run: python -m canary issue --state "$STATE" --report report.json --check-outcome "$CHECK_OUTCOME"
+
+      - name: Fail loudly
+        if: ${{ !cancelled() && steps.check.outcome != 'success' }}
+        env:
+          STATE: ${{ inputs.state }}
+        run: |
+          echo "::error title=${STATE^^} check failed::See the problems above, the run summary and the state's issue."
+          exit 1

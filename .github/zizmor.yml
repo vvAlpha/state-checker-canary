@@ -1,0 +1,7 @@
+rules:
+  # zizmor suggests GitHub's July 2026 `$/` self-repository syntax. The only
+  # local `uses:` here are job-level reusable workflow calls, which `./`
+  # already resolves at the caller's commit (no checkout involved), and
+  # actionlint 1.7.12 does not accept `$/` yet. Revisit when it does.
+  self-repository:
+    disable: true

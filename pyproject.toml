@@ -1,0 +1,28 @@
+[project]
+name = "state-checker-canary"
+version = "1.0.0"
+description = "Scheduled end-to-end checks of the state eligibility checker, one GitHub Actions workflow per state"
+requires-python = ">=3.12"
+dependencies = []  # the checks use the standard library only
+
+[dependency-groups]
+dev = ["ruff", "pytest", "actionlint-py", "zizmor"]
+
+[tool.uv]
+package = false
+# Resolve only releases at least two weeks old when the lock is refreshed.
+exclude-newer = "2 weeks"
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "BLE", "S", "SIM", "RUF"]
+ignore = ["S310"]  # urlopen on URLs this code builds from its own https base
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S101", "S105", "S106"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
