@@ -1,20 +1,15 @@
-"""The states the checker serves, in the console's order, and when each one runs.
+"""The states the checker serves, in the console's order.
 
-Every state has its own workflow (.github/workflows/state-<code>.yml), generated
-from this table by `python -m canary workflows --write`. CI fails when the files
-and the table disagree, so adding a state is one line here plus a regeneration.
+Each batch (.github/workflows/check.yml) runs one job per state listed here, so
+adding a state is one line in this table.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 
-# Every 3 hours. The states start STAGGER_MINUTES apart, so 25 checks spread over
-# the 3-hour window instead of landing on the checker, its proxies and GitHub's
-# scheduler at once (GitHub delays runs queued at the start of an hour).
+# How often a batch runs; must match the cron line in .github/workflows/check.yml.
 INTERVAL_HOURS = 3
-FIRST_MINUTE = 3
-STAGGER_MINUTES = 7
 
 
 @dataclass(frozen=True)
@@ -68,10 +63,3 @@ def get(code: str) -> State:
         return BY_CODE[code.strip().lower()]
     except KeyError:
         raise SystemExit(f"unknown state {code!r}; known: {', '.join(sorted(BY_CODE))}") from None
-
-
-def cron(state: State) -> str:
-    """The state's schedule in UTC: every INTERVAL_HOURS hours, at its own minute."""
-    start = FIRST_MINUTE + STAGGER_MINUTES * STATES.index(state)
-    hour, minute = divmod(start, 60)
-    return f"{minute} {hour}-23/{INTERVAL_HOURS} * * *"

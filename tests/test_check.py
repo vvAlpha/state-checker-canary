@@ -382,3 +382,13 @@ def test_round_trip_is_inconclusive_when_the_entity_turns_inactive():
     assert report.ok, report.problems
     assert report.round_trip["passed"] is None
     assert any("inconclusive: 200 now answers needs_reinstatement" in w for w in report.warnings)
+
+
+def test_a_probe_that_gets_no_registry_answer_is_not_inconclusive():
+    # found on GitHub 2026-11-03: a technical probe was taken for "the entity changed"
+    answers = _healthy()
+    answers[("200", False)] = [answer(outcome="technical", verdict="unknown", reason="TECHNICAL_TIMEOUT")]
+    report, _ = run(FakeClient(config(), answers))
+    assert not report.ok
+    assert report.round_trip["passed"] is False
+    assert not any("inconclusive" in w for w in report.warnings)

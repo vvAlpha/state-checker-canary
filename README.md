@@ -1,8 +1,12 @@
 # State checker canary
 
-Every 3 hours, each of the 25 states the eligibility checker serves gets an
-end-to-end check from GitHub Actions. A check fails loudly when the state's
-checker stops giving the right answers.
+Every 3 hours, one batch checks all 25 states the eligibility checker serves,
+end to end, from GitHub Actions: one job per state, side by side, then one
+summary table for the batch. A state fails loudly when its checker stops
+giving the right answers.
+
+In the Actions tab, each run is one batch. Its summary page is the batch
+table, with each state's detail folded underneath; its jobs are the states.
 
 ## What one check does
 
@@ -36,34 +40,39 @@ a state by mistake therefore fails its check rather than excusing itself.
 | The 20-minute budget running out, or the check itself crashing | |
 
 **Failing loudly** means:
-- a red run, with one error annotation per problem;
-- the run summary;
+- the state's red job in the batch, with one error annotation per problem;
+- the batch table, which lists every state with its first problem;
 - an issue labelled `canary` and `canary-<state>`, assigned to the repository owner, commented on by each later failure and closed by the first pass;
 - GitHub's failure email for scheduled runs, if the owner's notification settings have Actions emails on.
 
-Issues are opened only for runs of `main`; a run dispatched from a branch is
+Issues are opened only for runs of `main`; a batch dispatched from a branch is
 testing that branch.
 
 ## Layout
 
 ```
 canary/                  the logic, Python standard library only
-  states.py              the 25 states, their order and their schedule
+  states.py              the 25 states, in the console's order
   check.py               one state's check
   client.py              the checker's HTTP API, with transport retries
-  issue.py               the state's issue: open, comment, close
-  workflows.py           generates the per-state workflows and the table below
-  __main__.py            python -m canary check | issue | workflows
+  batch.py               reads a batch's reports: the summary table, each state's result
+  issue.py               a state's issue: open, comment, close
+  __main__.py            python -m canary plan | check | batch
 .github/workflows/
-  state-<code>.yml       one per state: schedule, manual run, then calls check-state.yml
-  check-state.yml        the steps every state runs
+  check.yml              the batch: plan, one check job per state, summary
   ci.yml                 lint, tests, workflow lint (actionlint, zizmor)
 ```
 
-Each state has a workflow of its own: its own schedule, run history, badge,
-manual run button and on/off switch. The per-state files are thin callers of
-one reusable workflow, so the steps are written once. They are generated from
-`canary/states.py`, and CI fails when the two disagree.
+```
+plan ── check CA ─┐
+     ├─ check CT ─┤
+     ├─ ...       ├── batch summary (table, each state's issue)
+     └─ check TX ─┘
+```
+
+Each state's job is independent: one failing never stops another, and none
+waits on another. The workflow only runs Python; what a check does is in
+`canary/`.
 
 ## Setup
 
@@ -83,58 +92,25 @@ server. None of them is in this repository or its secrets.
   schedule or an exhausted Actions allowance runs no step, so no step can
   report it. Badges and the last run time show it; an external heartbeat
   would catch it.
-- **Cost.** About 200 jobs a day. In a private repository each job bills at
-  least a minute, so that is about 6,000 runner minutes a month, more while a
-  state fails (the retry and round-trip pauses). GitHub Free includes about
-  2,000. Public repositories run standard runners free.
+- **Cost.** 27 jobs a batch (plan, 25 states, summary), 8 batches a day. In
+  a private repository each job bills at least a minute, so that is about
+  6,500 runner minutes a month, more while states fail (the retry and
+  round-trip pauses). GitHub Free includes about 2,000. Public repositories
+  run standard runners free.
 - **One store, 23 alerts.** When R2 is slow, every served state's round trip
   fails, so each state's issue opens. That is by design: each state stands
   alone.
 
 ## Running it
 
-- **On demand:** Actions, then the state's workflow, then *Run workflow*. Tick
-  *all_cases* to check every sample, not just two.
+- **On demand:** Actions, then *State checks*, then *Run workflow*. Leave
+  *states* as `all`, or name some (`oh,wa`) to rerun just those. Tick
+  *all_cases* to check every sample, not just two per state.
 - **Locally:**
   ```sh
   CHECKER_BASE_URL=https://checker.example.com python -m canary check --state wa
   ```
-- **Adding a state:** add a line to `canary/states.py`, run
-  `python -m canary workflows --write`, and commit the new workflow.
+- **Adding a state:** add a line to `canary/states.py`. The next batch gives
+  it a job.
 - **Development:** `uv sync`, then `uv run pytest`, `uv run ruff check .`,
   `uv run actionlint` and `uv run zizmor .github/workflows`.
-
-## States
-
-The states start 7 minutes apart, so 25 checks spread over each 3-hour window
-instead of hitting the checker and GitHub's scheduler at the top of the hour.
-
-<!-- states:start -->
-| State | Group | Runs at (UTC) | Last run |
-|---|---|---|---|
-| CA California | First 10 | 00:03, 03:03, ... | [![ca](https://github.com/vvAlpha/state-checker-canary/actions/workflows/state-ca.yml/badge.svg)](https://github.com/vvAlpha/state-checker-canary/actions/workflows/state-ca.yml) |
-| CT Connecticut | First 10 | 00:10, 03:10, ... | [![ct](https://github.com/vvAlpha/state-checker-canary/actions/workflows/state-ct.yml/badge.svg)](https://github.com/vvAlpha/state-checker-canary/actions/workflows/state-ct.yml) |
-| FL Florida | First 10 | 00:17, 03:17, ... | [![fl](https://github.com/vvAlpha/state-checker-canary/actions/workflows/state-fl.yml/badge.svg)](https://github.com/vvAlpha/state-checker-canary/actions/workflows/state-fl.yml) |
-| NC North Carolina | First 10 | 00:24, 03:24, ... | [![nc](https://github.com/vvAlpha/state-checker-canary/actions/workflows/state-nc.yml/badge.svg)](https://github.com/vvAlpha/state-checker-canary/actions/workflows/state-nc.yml) |
-| NY New York | First 10 | 00:31, 03:31, ... | [![ny](https://github.com/vvAlpha/state-checker-canary/actions/workflows/state-ny.yml/badge.svg)](https://github.com/vvAlpha/state-checker-canary/actions/workflows/state-ny.yml) |
-| PA Pennsylvania | First 10 | 00:38, 03:38, ... | [![pa](https://github.com/vvAlpha/state-checker-canary/actions/workflows/state-pa.yml/badge.svg)](https://github.com/vvAlpha/state-checker-canary/actions/workflows/state-pa.yml) |
-| VA Virginia | First 10 | 00:45, 03:45, ... | [![va](https://github.com/vvAlpha/state-checker-canary/actions/workflows/state-va.yml/badge.svg)](https://github.com/vvAlpha/state-checker-canary/actions/workflows/state-va.yml) |
-| WA Washington | First 10 | 00:52, 03:52, ... | [![wa](https://github.com/vvAlpha/state-checker-canary/actions/workflows/state-wa.yml/badge.svg)](https://github.com/vvAlpha/state-checker-canary/actions/workflows/state-wa.yml) |
-| WI Wisconsin | First 10 | 00:59, 03:59, ... | [![wi](https://github.com/vvAlpha/state-checker-canary/actions/workflows/state-wi.yml/badge.svg)](https://github.com/vvAlpha/state-checker-canary/actions/workflows/state-wi.yml) |
-| WY Wyoming | First 10 | 01:06, 04:06, ... | [![wy](https://github.com/vvAlpha/state-checker-canary/actions/workflows/state-wy.yml/badge.svg)](https://github.com/vvAlpha/state-checker-canary/actions/workflows/state-wy.yml) |
-| GA Georgia | Second 8 | 01:13, 04:13, ... | [![ga](https://github.com/vvAlpha/state-checker-canary/actions/workflows/state-ga.yml/badge.svg)](https://github.com/vvAlpha/state-checker-canary/actions/workflows/state-ga.yml) |
-| IN Indiana | Second 8 | 01:20, 04:20, ... | [![in](https://github.com/vvAlpha/state-checker-canary/actions/workflows/state-in.yml/badge.svg)](https://github.com/vvAlpha/state-checker-canary/actions/workflows/state-in.yml) |
-| MO Missouri | Second 8 | 01:27, 04:27, ... | [![mo](https://github.com/vvAlpha/state-checker-canary/actions/workflows/state-mo.yml/badge.svg)](https://github.com/vvAlpha/state-checker-canary/actions/workflows/state-mo.yml) |
-| MS Mississippi | Second 8 | 01:34, 04:34, ... | [![ms](https://github.com/vvAlpha/state-checker-canary/actions/workflows/state-ms.yml/badge.svg)](https://github.com/vvAlpha/state-checker-canary/actions/workflows/state-ms.yml) |
-| MT Montana | Second 8 | 01:41, 04:41, ... | [![mt](https://github.com/vvAlpha/state-checker-canary/actions/workflows/state-mt.yml/badge.svg)](https://github.com/vvAlpha/state-checker-canary/actions/workflows/state-mt.yml) |
-| NH New Hampshire | Second 8 | 01:48, 04:48, ... | [![nh](https://github.com/vvAlpha/state-checker-canary/actions/workflows/state-nh.yml/badge.svg)](https://github.com/vvAlpha/state-checker-canary/actions/workflows/state-nh.yml) |
-| NV Nevada | Second 8 | 01:55, 04:55, ... | [![nv](https://github.com/vvAlpha/state-checker-canary/actions/workflows/state-nv.yml/badge.svg)](https://github.com/vvAlpha/state-checker-canary/actions/workflows/state-nv.yml) |
-| VT Vermont | Second 8 | 02:02, 05:02, ... | [![vt](https://github.com/vvAlpha/state-checker-canary/actions/workflows/state-vt.yml/badge.svg)](https://github.com/vvAlpha/state-checker-canary/actions/workflows/state-vt.yml) |
-| AZ Arizona | Third 7 | 02:09, 05:09, ... | [![az](https://github.com/vvAlpha/state-checker-canary/actions/workflows/state-az.yml/badge.svg)](https://github.com/vvAlpha/state-checker-canary/actions/workflows/state-az.yml) |
-| MA Massachusetts | Third 7 | 02:16, 05:16, ... | [![ma](https://github.com/vvAlpha/state-checker-canary/actions/workflows/state-ma.yml/badge.svg)](https://github.com/vvAlpha/state-checker-canary/actions/workflows/state-ma.yml) |
-| MI Michigan | Third 7 | 02:23, 05:23, ... | [![mi](https://github.com/vvAlpha/state-checker-canary/actions/workflows/state-mi.yml/badge.svg)](https://github.com/vvAlpha/state-checker-canary/actions/workflows/state-mi.yml) |
-| OH Ohio | Third 7 | 02:30, 05:30, ... | [![oh](https://github.com/vvAlpha/state-checker-canary/actions/workflows/state-oh.yml/badge.svg)](https://github.com/vvAlpha/state-checker-canary/actions/workflows/state-oh.yml) |
-| OR Oregon | Third 7 | 02:37, 05:37, ... | [![or](https://github.com/vvAlpha/state-checker-canary/actions/workflows/state-or.yml/badge.svg)](https://github.com/vvAlpha/state-checker-canary/actions/workflows/state-or.yml) |
-| SD South Dakota | Third 7 | 02:44, 05:44, ... | [![sd](https://github.com/vvAlpha/state-checker-canary/actions/workflows/state-sd.yml/badge.svg)](https://github.com/vvAlpha/state-checker-canary/actions/workflows/state-sd.yml) |
-| TX Texas | Third 7 | 02:51, 05:51, ... | [![tx](https://github.com/vvAlpha/state-checker-canary/actions/workflows/state-tx.yml/badge.svg)](https://github.com/vvAlpha/state-checker-canary/actions/workflows/state-tx.yml) |
-<!-- states:end -->

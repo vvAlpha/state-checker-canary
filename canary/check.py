@@ -385,7 +385,8 @@ class Checker:
             if not r.ok:
                 continue
             if body.get("basis") == "live":
-                if not malformed(body, state, live.eid, basis="live") and not _storable(body):
+                fine = not malformed(body, state, live.eid, basis="live")
+                if fine and body["outcome"] == "verified" and not _storable(body):
                     # The entity changed (dissolved, say) into an answer storage never serves.
                     trip["passed"] = None
                     report.warnings.append(

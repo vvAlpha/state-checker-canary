@@ -1,6 +1,6 @@
 # Lint and test the canary itself on every push and pull request: Python lint,
-# unit tests, the per-state workflows in step with canary/states.py, and the
-# workflows themselves (actionlint for correctness, zizmor for security).
+# unit tests, the batch plan, and the workflows themselves (actionlint for
+# correctness, zizmor for security).
 name: CI
 
 on:
@@ -37,8 +37,8 @@ jobs:
           uv run ruff format --check .
       - name: Unit tests
         run: uv run pytest -q
-      - name: Per-state workflows match canary/states.py
-        run: uv run python -m canary workflows
+      - name: The batch plan lists every state
+        run: uv run python -m canary plan | python3 -c 'import json,sys; assert len(json.load(sys.stdin)) == 25'
       - name: Lint the workflows
         run: |
           uv run actionlint

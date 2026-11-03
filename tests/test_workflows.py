@@ -3,15 +3,13 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from canary import states, workflows
+from canary import states
 from canary.gha import annotate, commands_off
 
 ROOT = Path(__file__).resolve().parent.parent
+WORKFLOWS = sorted((ROOT / ".github" / "workflows").glob("*.yml"))
+CHECK = (ROOT / ".github" / "workflows" / "check.yml").read_text()
 SHA_PIN = re.compile(r"uses:\s+([\w.-]+/[\w.-]+)@([0-9a-f]{40})\s+#\s+v\d")
-
-
-def test_every_state_has_an_up_to_date_workflow():
-    assert workflows.drift() == []
 
 
 def test_25_states_with_unique_codes():
@@ -19,32 +17,37 @@ def test_25_states_with_unique_codes():
     assert len(states.BY_CODE) == 25
 
 
-def test_schedules_are_distinct_off_the_hour_and_inside_the_interval():
-    starts = []
-    for s in states.STATES:
-        minute, hours, *_ = states.cron(s).split()
-        first_hour = int(hours.split("-")[0])
-        assert hours.endswith(f"-23/{states.INTERVAL_HOURS}")
-        assert first_hour < states.INTERVAL_HOURS and minute != "0"
-        starts.append(first_hour * 60 + int(minute))
-    assert len(set(starts)) == len(starts)
-    assert max(starts) < states.INTERVAL_HOURS * 60
+def test_the_batch_runs_every_interval_off_the_hour():
+    minute, hours = re.search(r'cron: "(\d+) (\S+) \* \* \*"', CHECK).groups()
+    assert hours == f"*/{states.INTERVAL_HOURS}" and minute != "0"
+
+
+def test_one_state_never_stops_another():
+    assert "fail-fast: false" in CHECK
+    assert "state: ${{ fromJSON(needs.plan.outputs.states) }}" in CHECK
+
+
+def test_only_the_summary_job_can_write_issues():
+    jobs = CHECK.split("\njobs:\n", 1)[1]
+    blocks = re.split(r"\n  (?=[a-z]+:\n)", jobs)
+    writers = [b.split(":", 1)[0].strip() for b in blocks if "issues: write" in b]
+    assert writers == ["summary"]
 
 
 def test_every_third_party_action_is_pinned_to_a_full_sha():
-    for f in sorted((ROOT / ".github" / "workflows").glob("*.yml")):
+    for f in WORKFLOWS:
         for line in f.read_text().splitlines():
             if "uses:" in line and not line.strip().startswith("uses: ./"):
                 assert SHA_PIN.search(line), f"{f.name}: not pinned to a SHA with a version comment: {line.strip()}"
 
 
 def test_workflows_default_to_no_permissions():
-    for f in sorted((ROOT / ".github" / "workflows").glob("*.yml")):
+    for f in WORKFLOWS:
         assert "\npermissions: {}\n" in f.read_text(), f.name
 
 
 def test_no_expression_is_expanded_inside_a_run_script():
-    for f in sorted((ROOT / ".github" / "workflows").glob("*.yml")):
+    for f in WORKFLOWS:
         in_run = False
         for line in f.read_text().splitlines():
             stripped = line.strip()
@@ -56,6 +59,12 @@ def test_no_expression_is_expanded_inside_a_run_script():
                 in_run = False
             if in_run:
                 assert "${{" not in line, f"{f.name}: {stripped}"
+
+
+def test_the_check_step_times_out_before_its_job():
+    step = re.search(r"id: check\n(?:.*\n)*?\s+timeout-minutes: (\d+)", CHECK)
+    job = re.search(r"\n  check:\n(?:.*\n)*?    timeout-minutes: (\d+)", CHECK)
+    assert step and job and int(step.group(1)) < int(job.group(1))
 
 
 def test_annotations_escape_newlines_and_separators(capsys):
@@ -77,15 +86,3 @@ def test_commands_off_wraps_output_in_a_fresh_token(capsys):
     with commands_off():
         pass
     assert capsys.readouterr().out.splitlines()[0] != first
-
-
-def test_concurrency_is_per_branch():
-    for s in states.STATES:
-        assert f"group: state-{s.code}-${{{{ github.ref }}}}" in workflows.path(s).read_text()
-
-
-def test_the_check_step_times_out_before_the_job():
-    text = (ROOT / ".github" / "workflows" / "check-state.yml").read_text()
-    step = re.search(r"id: check\n(?:.*\n)*?\s+timeout-minutes: (\d+)", text)
-    job = re.search(r"\n    timeout-minutes: (\d+)", text)
-    assert step and job and int(step.group(1)) < int(job.group(1))

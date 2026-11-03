@@ -5,7 +5,7 @@ import json
 import pytest
 
 from canary import __main__ as cli
-from canary import issue
+from canary import batch, issue, states
 from canary.check import Checker, Report
 
 
@@ -20,11 +20,34 @@ def _fake_run(ok):
     return run
 
 
+# plan
+
+
+def test_plan_lists_every_state_in_order(capsys):
+    cli.main(["plan"])
+    plan = json.loads(capsys.readouterr().out)
+    assert [p["code"] for p in plan] == [s.code for s in states.STATES]
+    assert plan[0] == {"code": "ca", "name": "CA California"}
+
+
+def test_plan_takes_a_comma_list_without_duplicates(capsys):
+    cli.main(["plan", "--states", " OH, wa ,oh,"])
+    assert [p["code"] for p in json.loads(capsys.readouterr().out)] == ["oh", "wa"]
+
+
+def test_plan_refuses_an_unknown_state():
+    with pytest.raises(SystemExit):
+        cli.main(["plan", "--states", "oh,zz"])
+
+
+# check
+
+
 @pytest.mark.parametrize("ok, code", [(True, 0), (False, 1)])
 def test_check_writes_report_summary_and_annotations(tmp_path, monkeypatch, capsys, ok, code):
     monkeypatch.setenv("CHECKER_BASE_URL", "https://checker.invalid")
     monkeypatch.setattr(Checker, "run", _fake_run(ok))
-    out, summary = tmp_path / "r.json", tmp_path / "s.md"
+    out, summary = tmp_path / "out" / "r.json", tmp_path / "s.md"
     assert cli.main(["check", "--state", "AZ", "--json", str(out), "--summary", str(summary)]) == code
     assert json.loads(out.read_text())["ok"] is ok
     assert summary.read_text().startswith("## ")
@@ -51,42 +74,6 @@ def test_all_cases_must_be_a_boolean(bad):
         cli.main(["check", "--state", "az", "--all-cases", bad])
 
 
-def _capture_sync(monkeypatch):
-    seen = {}
-
-    def sync(gh, state, *, failed, body, run_url, assignee=None):
-        seen.update(failed=failed, body=body, state=state.code)
-        return "ok"
-
-    monkeypatch.setattr(issue, "sync", sync)
-    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
-    monkeypatch.setenv("GH_TOKEN", "tok")
-    return seen
-
-
-def test_issue_with_a_missing_report_counts_as_failed(tmp_path, monkeypatch):
-    seen = _capture_sync(monkeypatch)
-    assert (
-        cli.main(["issue", "--state", "az", "--report", str(tmp_path / "none.json"), "--check-outcome", "failure"]) == 0
-    )
-    assert seen["failed"] is True and "did not write a usable report" in seen["body"]
-
-
-@pytest.mark.parametrize(
-    "ok, outcome, failed", [(True, "success", False), (False, "failure", True), (True, "failure", True)]
-)
-def test_issue_follows_the_report_and_the_step_outcome(tmp_path, monkeypatch, ok, outcome, failed):
-    seen = _capture_sync(monkeypatch)
-    report = Report("AZ", "Arizona", "t", served=True)
-    if not ok:
-        report.problems.append("p")
-    path = tmp_path / "r.json"
-    path.write_text(json.dumps(report.to_dict()))
-    cli.main(["issue", "--state", "az", "--report", str(path), "--check-outcome", outcome])
-    assert seen["failed"] is failed
-    assert seen["body"].startswith("## ")
-
-
 def test_check_redacts_the_host_from_report_summary_and_output(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("CHECKER_BASE_URL", "https://secret-host.invalid")
 
@@ -106,7 +93,7 @@ def test_check_redacts_the_host_from_report_summary_and_output(tmp_path, monkeyp
     assert printed.count("secret-host") == 1 and "::add-mask::secret-host.invalid" in printed
 
 
-def test_check_prints_the_summary_with_commands_off(tmp_path, monkeypatch, capsys):
+def test_check_prints_the_summary_with_commands_off(monkeypatch, capsys):
     monkeypatch.setenv("CHECKER_BASE_URL", "https://checker.invalid")
     monkeypatch.setattr(Checker, "run", _fake_run(False))
     cli.main(["check", "--state", "az"])
@@ -118,58 +105,138 @@ def test_check_prints_the_summary_with_commands_off(tmp_path, monkeypatch, capsy
     assert any(line.startswith("::error ") for line in lines[end:])  # annotations after commands resume
 
 
-@pytest.mark.parametrize(
-    "data",
-    [
-        {"cases": [None], "problems": [], "warnings": []},
-        {"cases": [], "problems": "x", "warnings": []},
-        [],
-        {"cases": [], "problems": [], "warnings": [], "state": "AZ"},  # missing name, started_at
-    ],
-)
-def test_issue_with_a_malformed_report_counts_as_failed(tmp_path, monkeypatch, data):
-    seen = _capture_sync(monkeypatch)
-    path = tmp_path / "r.json"
-    path.write_text(json.dumps(data))
-    cli.main(["issue", "--state", "az", "--report", str(path), "--check-outcome", "success"])
-    assert seen["failed"] is True and "did not write a usable report" in seen["body"]
+# batch
 
 
-def test_issue_ignores_a_stored_ok_that_contradicts_the_problems(tmp_path, monkeypatch):
-    seen = _capture_sync(monkeypatch)
-    report = Report("AZ", "Arizona", "t", served=True, problems=["p"])
-    path = tmp_path / "r.json"
-    path.write_text(json.dumps({**report.to_dict(), "ok": True}))
-    cli.main(["issue", "--state", "az", "--report", str(path), "--check-outcome", "success"])
-    assert seen["failed"] is True
+def _write(folder, report=None, outcome="success", raw=None):
+    folder.mkdir(parents=True)
+    if raw is not None or report is not None:
+        (folder / "report.json").write_text(json.dumps(raw if raw is not None else report.to_dict()))
+    if outcome is not None:
+        (folder / "outcome.txt").write_text(outcome + "\n")
 
 
-def test_issue_assigns_the_repository_owner(tmp_path, monkeypatch):
+def _plan(*codes):
+    return json.dumps([{"code": c, "name": c.upper()} for c in codes])
+
+
+@pytest.fixture
+def synced(monkeypatch):
     seen = {}
 
-    def sync(gh, state, *, failed, body, run_url, assignee):
-        seen["assignee"] = assignee
+    def sync(gh, state, *, failed, body, run_url, assignee=None):
+        seen[state.code] = {"failed": failed, "body": body, "assignee": assignee}
         return "ok"
 
     monkeypatch.setattr(issue, "sync", sync)
     monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
     monkeypatch.setenv("GH_TOKEN", "tok")
     monkeypatch.setenv("GITHUB_REPOSITORY_OWNER", "someone")
-    cli.main(["issue", "--state", "az", "--report", str(tmp_path / "none"), "--check-outcome", "failure"])
-    assert seen["assignee"] == "someone"
+    return seen
+
+
+def test_batch_summarizes_and_syncs_every_planned_state(tmp_path, synced, capsys):
+    good = Report("AZ", "Arizona", "t", served=True)
+    bad = Report("CA", "California", "t", served=True, problems=["200: wrong"])
+    _write(tmp_path / "az", good)
+    _write(tmp_path / "ca", bad, outcome="failure")
+    summary = tmp_path / "summary.md"
+    code = cli.main(["batch", "--plan", _plan("az", "ca", "ct"), "--reports", str(tmp_path),
+                     "--summary", str(summary), "--issues"])  # fmt: skip
+    assert code == 0
+    assert {k: v["failed"] for k, v in synced.items()} == {"az": False, "ca": True, "ct": True}
+    assert synced["ct"]["assignee"] == "someone" and "the job left no report" in synced["ct"]["body"]
+    text = summary.read_text()
+    assert "1 of 3 states passed" in text
+    assert "| AZ Arizona | ✅ |" in text and "| CA California | ❌ |" in text and "200: wrong" in text
+    assert "::error title=State checks failed::2 of 3: CA, CT" in capsys.readouterr().out
+
+
+def test_batch_without_issues_flag_touches_no_issue(tmp_path, synced):
+    _write(tmp_path / "az", Report("AZ", "Arizona", "t", served=True))
+    cli.main(["batch", "--plan", _plan("az"), "--reports", str(tmp_path)])
+    assert synced == {}
 
 
 @pytest.mark.parametrize(
-    "extra",
+    "raw",
     [
-        {"cases": [{"eid": "1", "expect": "dead", "problem": "wrong"}]},
-        {"round_trip": {"checked": True, "passed": False}},
+        {"cases": [None], "problems": [], "warnings": []},
+        {"cases": [], "problems": "x", "warnings": []},
+        [],
+        {"cases": [], "problems": [], "warnings": [], "state": "AZ"},  # missing name, started_at
+        {"cases": [{"eid": "1", "expect": "dead", "problem": "wrong"}], "problems": [], "warnings": [],
+         "state": "AZ", "name": "Arizona", "started_at": "t"},
+        {"cases": [], "problems": [], "warnings": [], "state": "AZ", "name": "Arizona", "started_at": "t",
+         "round_trip": {"checked": True, "passed": False}},
+    ],
+)  # fmt: skip
+def test_an_unusable_or_contradictory_report_counts_as_failed(tmp_path, raw):
+    _write(tmp_path / "az", raw=raw)
+    result = batch.load(states.get("az"), tmp_path / "az")
+    assert result.failed and result.report is None
+
+
+def test_a_stored_ok_never_overrides_the_problems(tmp_path):
+    report = Report("AZ", "Arizona", "t", served=True, problems=["p"])
+    _write(tmp_path / "az", raw={**report.to_dict(), "ok": True})
+    assert batch.load(states.get("az"), tmp_path / "az").failed
+
+
+@pytest.mark.parametrize("outcome", ["failure", None])
+def test_a_check_step_that_did_not_succeed_fails_the_state(tmp_path, outcome):
+    _write(tmp_path / "az", Report("AZ", "Arizona", "t", served=True), outcome=outcome)
+    assert batch.load(states.get("az"), tmp_path / "az").failed
+
+
+def test_plan_refuses_an_empty_selection():
+    with pytest.raises(SystemExit):
+        cli.main(["plan", "--states", ",,,"])
+
+
+def test_one_state_issue_error_does_not_stop_the_others(tmp_path, monkeypatch, capsys):
+    seen = []
+
+    def sync(gh, state, *, failed, body, run_url, assignee=None):
+        seen.append(state.code)
+        if state.code == "az":
+            raise issue.GitHubError("POST /issues/3/comments: HTTP 403: locked")
+        return "ok"
+
+    monkeypatch.setattr(issue, "sync", sync)
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+    monkeypatch.setenv("GH_TOKEN", "tok")
+    code = cli.main(["batch", "--plan", _plan("az", "ca"), "--reports", str(tmp_path), "--issues"])
+    assert seen == ["az", "ca"] and code == 1
+    assert "::error title=Issue not updated::AZ: POST /issues/3/comments: HTTP 403: locked" in capsys.readouterr().out
+
+
+def test_a_round_trip_that_is_not_an_object_counts_as_failed(tmp_path):
+    report = Report("AZ", "Arizona", "t", served=True)
+    _write(tmp_path / "az", raw={**report.to_dict(), "round_trip": "broken"})
+    result = batch.load(states.get("az"), tmp_path / "az")
+    assert result.failed and result.report is None
+
+
+def test_a_failed_step_with_a_passing_report_says_why_in_body_and_table(tmp_path):
+    _write(tmp_path / "az", Report("AZ", "Arizona", "t", served=True), outcome="failure")
+    result = batch.load(states.get("az"), tmp_path / "az")
+    assert result.failed and "the check step ended as failure" in result.body
+    assert "the check step ended as failure" in batch.summary([result], "t")
+
+
+@pytest.mark.parametrize(
+    "trip",
+    [
+        {"checked": True, "passed": []},
+        {"checked": "yes", "passed": True},
+        {"checked": True, "passed": True, "tries": "x"},
+        {"checked": True, "passed": True, "tries": [{"basis": "store"}]},
     ],
 )
-def test_issue_rejects_a_report_whose_parts_failed_without_problems(tmp_path, monkeypatch, extra):
-    seen = _capture_sync(monkeypatch)
+def test_a_malformed_round_trip_counts_as_failed_and_the_summary_still_renders(tmp_path, trip):
     report = Report("AZ", "Arizona", "t", served=True)
-    path = tmp_path / "r.json"
-    path.write_text(json.dumps({**report.to_dict(), **extra}))
-    cli.main(["issue", "--state", "az", "--report", str(path), "--check-outcome", "success"])
-    assert seen["failed"] is True
+    _write(tmp_path / "az", raw={**report.to_dict(), "round_trip": trip})
+    result = batch.load(states.get("az"), tmp_path / "az")
+    assert result.failed and result.report is None
+    assert "AZ Arizona" in batch.summary([result], "t")

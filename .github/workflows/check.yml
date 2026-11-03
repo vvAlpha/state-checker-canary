@@ -1,0 +1,159 @@
+# State checks: one batch every 3 hours, one job per state, one summary.
+#
+#   plan ── check (one job per state, in parallel) ── batch summary
+#
+# - plan lists the batch's states from canary/states.py (all of them, or the
+#   ones a manual run names), so a new state gets its job without an edit here.
+# - Each state's job runs `python -m canary check`: live lookups of the state's
+#   sample ids through the deployed checker, then a storage round trip. It
+#   writes report.json, and is red on any problem. One state's failure never
+#   stops another's (fail-fast off), and no job waits on another state.
+# - The batch summary reads every state's report: one table for the batch, the
+#   detail of each state, and each state's issue opened, commented on or closed.
+#   A state whose job left no report counts as failed.
+# - Fails loudly: the state's red job, an error annotation per problem, the
+#   batch table, the state's issue (assigned to the repository owner), and
+#   GitHub's failure email for scheduled runs.
+name: State checks
+run-name: ${{ github.event_name == 'schedule' && 'Scheduled batch' || format('Manual batch ({0})', inputs.states) }}
+
+on:
+  schedule:
+    # Every 3 hours at :17, off the top of the hour, when GitHub delays queued runs.
+    - cron: "17 */3 * * *"
+  workflow_dispatch:
+    inputs:
+      states:
+        description: '"all", or state codes separated by commas (e.g. "oh,wa")'
+        type: string
+        default: all
+      all_cases:
+        description: Check every sample id, not just two per state
+        type: boolean
+        default: false
+
+permissions: {}
+
+# Per branch, so a test run from a branch never replaces a pending batch of main.
+# GitHub keeps one pending run per group: a batch lasts minutes and they start 3
+# hours apart, so only a manual run queued behind a running one can be replaced.
+concurrency:
+  group: state-checks-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    name: Plan the batch
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read # check out this repository
+    outputs:
+      states: ${{ steps.plan.outputs.states }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version-file: .python-version
+      - id: plan
+        env:
+          STATES: ${{ inputs.states || 'all' }}
+        run: |
+          states=$(python -m canary plan --states "$STATES")
+          echo "states=$states" >> "$GITHUB_OUTPUT"
+
+  check:
+    name: ${{ matrix.state.name }}
+    needs: plan
+    runs-on: ubuntu-24.04
+    # The check stops starting lookups after 20 minutes (check.BUDGET_SECONDS) and
+    # its step times out at 25, leaving time to upload whatever it wrote; a state
+    # with no report counts as failed in the summary.
+    timeout-minutes: 30
+    permissions:
+      contents: read # check out this repository
+    strategy:
+      fail-fast: false
+      matrix:
+        state: ${{ fromJSON(needs.plan.outputs.states) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version-file: .python-version
+
+      - name: Check through the checker
+        id: check
+        continue-on-error: true
+        # A step timeout fails only this step, so the report is still kept; a job
+        # timeout would cancel the steps after it.
+        timeout-minutes: 25
+        env:
+          CHECKER_BASE_URL: ${{ secrets.CHECKER_BASE_URL }}
+          STATE: ${{ matrix.state.code }}
+          ALL_CASES: ${{ inputs.all_cases == true }}
+        run: python -m canary check --state "$STATE" --all-cases "$ALL_CASES" --json "out/$STATE/report.json"
+
+      - name: Record the outcome
+        if: ${{ !cancelled() }}
+        env:
+          OUTCOME: ${{ steps.check.outcome }}
+          STATE: ${{ matrix.state.code }}
+        run: mkdir -p "out/$STATE" && echo "$OUTCOME" > "out/$STATE/outcome.txt"
+
+      - name: Keep the report
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: report-${{ matrix.state.code }}
+          path: out/
+          retention-days: 30
+
+      - name: Fail loudly
+        if: ${{ !cancelled() && steps.check.outcome != 'success' }}
+        env:
+          STATE: ${{ matrix.state.code }}
+        run: |
+          echo "::error title=${STATE^^} check failed::See the problems above and the batch summary."
+          exit 1
+
+  summary:
+    name: Batch summary
+    needs: [plan, check]
+    if: ${{ !cancelled() && needs.plan.result == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read # check out this repository
+      issues: write # open, comment on and close each state's issue
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version-file: .python-version
+
+      # Each artifact holds <code>/report.json and <code>/outcome.txt, so merged
+      # they give one folder per state however many matched. A state whose job
+      # uploaded nothing has no folder and counts as failed.
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: report-*
+          path: reports
+          merge-multiple: true
+
+      - name: Summarize the batch and update each state's issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PLAN: ${{ needs.plan.outputs.states }}
+          ON_MAIN: ${{ github.ref == 'refs/heads/main' }}
+        run: |
+          issues=""; [ "$ON_MAIN" = true ] && issues="--issues"
+          python -m canary batch --plan "$PLAN" --reports reports --summary "$GITHUB_STEP_SUMMARY" $issues
