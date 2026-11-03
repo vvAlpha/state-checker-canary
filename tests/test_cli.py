@@ -246,3 +246,17 @@ def test_a_failed_step_with_problems_does_not_repeat_itself(tmp_path):
     _write(tmp_path / "az", Report("AZ", "Arizona", "t", served=True, problems=["200: wrong"]), outcome="failure")
     result = batch.load(states.get("az"), tmp_path / "az")
     assert result.failed and "check step ended" not in result.body
+
+
+@pytest.mark.parametrize("passed", [0, 1, 0.0])
+def test_a_round_trip_passed_that_is_not_a_boolean_counts_as_failed(tmp_path, passed):
+    report = Report("AZ", "Arizona", "t", served=True)
+    _write(tmp_path / "az", raw={**report.to_dict(), "round_trip": {"checked": True, "passed": passed, "tries": []}})
+    assert batch.load(states.get("az"), tmp_path / "az").failed
+
+
+def test_an_outcome_file_that_is_not_text_fails_the_state_without_crashing(tmp_path):
+    _write(tmp_path / "az", Report("AZ", "Arizona", "t", served=True), outcome=None)
+    (tmp_path / "az" / "outcome.txt").write_bytes(b"\xff\xfe")
+    result = batch.load(states.get("az"), tmp_path / "az")
+    assert result.failed and "AZ Arizona" in batch.summary([result], "t")

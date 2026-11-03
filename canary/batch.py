@@ -50,7 +50,7 @@ def report_from(data) -> Report:
         if (
             not isinstance(trip, dict)
             or not isinstance(trip.get("checked"), bool)
-            or trip.get("passed") not in (True, False, None)
+            or not any(trip.get("passed") is v for v in (True, False, None))  # 0 == False, but is not
             or not isinstance(tries, list)
             or not all(isinstance(t, dict) and {"basis", "error", "age_seconds"} <= t.keys() for t in tries)
         ):
@@ -71,7 +71,7 @@ def load(state: State, folder: Path) -> StateResult:
         return StateResult(state, None, True, f"{reason} (it failed before or while checking)")
     try:
         outcome = (folder / "outcome.txt").read_text().strip()
-    except OSError:
+    except (OSError, ValueError):  # missing, or not text: an unknown outcome fails the state
         outcome = "unknown"
     # From the report's problems, never a stored `ok`, and red if the step was.
     # Named only when the report looks clean, as the report's problems say the rest.
