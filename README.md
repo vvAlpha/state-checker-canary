@@ -67,7 +67,7 @@ pools/<code>.txt         200 entity ids per state, verified before; "active" mar
 ```
 plan ── check CA ─┐
      ├─ check CT ─┤
-     ├─ ...       ├── batch summary (table, each state's issue)
+     ├─ ...       ├── batch summary (table, each state's issue, push to the console)
      └─ check TX ─┘
 ```
 
@@ -77,11 +77,12 @@ waits on another. The workflow only runs Python; what a check does is in
 
 ## Setup
 
-One repository secret:
+Two repository secrets:
 
 | Secret | Value |
 |---|---|
 | `CHECKER_BASE_URL` | The checker's https origin, no path (for example `https://checker.example.com`) |
+| `CANARY_PUSH_SECRET` | Signs each batch's push to the checker's console; the same value as the checker's `CANARY_PUSH_SECRET` |
 
 The checks call the checker's public lookup API, so the registry scraping, the
 proxies, the captcha handling and the R2 credentials all stay on the checker's
@@ -89,10 +90,11 @@ server. None of them is in this repository or its secrets.
 
 ## Limits
 
-- **Nothing notices the canary stopping.** A disabled workflow, a dropped
+- **Nothing here notices the canary stopping.** A disabled workflow, a dropped
   schedule or an exhausted Actions allowance runs no step, so no step can
-  report it. Badges and the last run time show it; an external heartbeat
-  would catch it.
+  report it. The checker's console can: each batch pushes its results there
+  (`canary/publish.py`), and past four hours without one the console says the
+  checks have stopped reporting. Nobody is alerted until someone looks.
 - **Cost.** 27 jobs a batch (plan, 25 states, summary), 8 batches a day.
   Five spaced lookups and a round trip take about 2 to 3 minutes per state,
   and a private repository bills each job by the started minute: about 75

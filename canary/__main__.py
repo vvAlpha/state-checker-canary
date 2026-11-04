@@ -10,7 +10,7 @@ import urllib.parse
 from datetime import UTC, datetime
 from pathlib import Path
 
-from . import batch, gha, issue, pools, states
+from . import batch, gha, issue, pools, publish, states
 from .check import COUNT, Checker, markdown
 from .client import CheckerClient, base_url
 
@@ -113,8 +113,35 @@ def cmd_batch(args) -> int:
         gha.annotate("error", "State checks failed", f"{len(failed)} of {len(results)}: {', '.join(failed)}")
     for e in errors:
         gha.annotate("error", "Issue not updated", e)
+    pushed = _publish(results, run_url) if args.publish else True
     # Each failing state's own job is red already; this job fails on its own errors.
-    return 1 if errors else 0
+    return 1 if errors or not pushed else 0
+
+
+def _publish(results: list[batch.StateResult], run_url: str | None) -> bool:
+    """Push the batch to the checker's console; False, and an error annotation, if it did not arrive."""
+    try:
+        base = base_url(os.environ.get("CHECKER_BASE_URL"))
+        secret = os.environ.get("CANARY_PUSH_SECRET", "")
+        if not secret:
+            raise publish.PushError("CANARY_PUSH_SECRET is not set")
+        if not run_url:
+            raise publish.PushError("no run link to send")
+        host = urllib.parse.urlsplit(base).hostname or ""
+        gha.mask(host)
+        hidden = sorted({base, urllib.parse.urlsplit(base).netloc, host} - {""}, key=len, reverse=True)
+        data = publish.payload(
+            results,
+            at=publish.checked_at(results, datetime.now(UTC).isoformat(timespec="seconds")),
+            run_url=run_url,
+            event=os.environ.get("GITHUB_EVENT_NAME") or "unknown",
+        )
+        publish.push(base, secret, redact(data, hidden))
+    except (publish.PushError, SystemExit) as e:  # base_url() exits on a bad address
+        gha.annotate("error", "Batch not pushed to the console", str(e))
+        return False
+    print("pushed to the console")
+    return True
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -137,6 +164,11 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--reports", required=True, help="folder with one sub-folder per state code")
     p.add_argument("--summary", help="append the batch summary here (GITHUB_STEP_SUMMARY)")
     p.add_argument("--issues", action="store_true", help="open, comment on or close each state's issue")
+    p.add_argument(
+        "--publish",
+        action="store_true",
+        help="push the results to the checker's console (env CHECKER_BASE_URL, CANARY_PUSH_SECRET)",
+    )
     p.set_defaults(func=cmd_batch)
 
     args = parser.parse_args(argv)
