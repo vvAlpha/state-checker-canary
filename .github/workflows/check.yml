@@ -160,5 +160,6 @@ jobs:
           CHECKER_BASE_URL: ${{ secrets.CHECKER_BASE_URL }}
           CANARY_PUSH_SECRET: ${{ secrets.CANARY_PUSH_SECRET }}
         run: |
-          flags=""; [ "$ON_MAIN" = true ] && flags="--issues --publish"
-          python -m canary batch --plan "$PLAN" --reports reports --summary "$GITHUB_STEP_SUMMARY" $flags
+          flags=()
+          if [ "$ON_MAIN" = true ]; then flags=(--issues --publish); fi
+          python -m canary batch --plan "$PLAN" --reports reports --summary "$GITHUB_STEP_SUMMARY" "${flags[@]}"
