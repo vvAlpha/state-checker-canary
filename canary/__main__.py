@@ -10,8 +10,8 @@ import urllib.parse
 from datetime import UTC, datetime
 from pathlib import Path
 
-from . import batch, gha, issue, states
-from .check import Checker, markdown
+from . import batch, gha, issue, pools, states
+from .check import COUNT, Checker, markdown
 from .client import CheckerClient, base_url
 
 
@@ -20,12 +20,15 @@ def _run_url() -> str | None:
     return f"{server}/{repo}/actions/runs/{run}" if server and repo and run else None
 
 
-def _bool(text: str) -> bool:
-    if text.strip().lower() in ("true", "1", "yes"):
-        return True
-    if text.strip().lower() in ("false", "0", "no", ""):
-        return False
-    raise argparse.ArgumentTypeError(f"expected true or false, got {text!r}")
+def _count(text: str) -> int:
+    """How many entities to look up per state: 1 to 20 (the pools hold 200)."""
+    try:
+        n = int(text.strip() or COUNT)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected a whole number, got {text!r}") from None
+    if not 1 <= n <= 20:
+        raise argparse.ArgumentTypeError(f"expected 1 to 20, got {n}")
+    return n
 
 
 def redact(value, secrets_: list[str]):
@@ -61,7 +64,7 @@ def cmd_check(args) -> int:
     host = urllib.parse.urlsplit(base).hostname or ""
     gha.mask(host)  # the host alone, as error messages print it
     hidden = sorted({base, urllib.parse.urlsplit(base).netloc, host} - {""}, key=len, reverse=True)
-    raw = Checker(CheckerClient(base)).run(state, all_cases=args.all_cases).to_dict()
+    raw = Checker(CheckerClient(base)).run(state, pools.load(state), count=args.count).to_dict()
     report = batch.report_from(redact(raw, hidden))
     if args.json:
         Path(args.json).parent.mkdir(parents=True, exist_ok=True)
@@ -124,7 +127,7 @@ def main(argv: list[str] | None = None) -> int:
 
     p = sub.add_parser("check", help="check one state through the deployed checker (env CHECKER_BASE_URL)")
     p.add_argument("--state", required=True)
-    p.add_argument("--all-cases", type=_bool, default=False, help="check every sample id (true/false)")
+    p.add_argument("--count", type=_count, default=COUNT, help=f"entities to look up from the pool (default {COUNT})")
     p.add_argument("--json", help="write the report here")
     p.add_argument("--summary", help="append the markdown summary here (GITHUB_STEP_SUMMARY)")
     p.set_defaults(func=cmd_check)

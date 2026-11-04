@@ -5,12 +5,12 @@ import json
 import pytest
 
 from canary import __main__ as cli
-from canary import batch, issue, states
+from canary import batch, issue, pools, states
 from canary.check import Checker, Report
 
 
 def _fake_run(ok):
-    def run(self, state, *, all_cases=False):
+    def run(self, state, pool, *, count=5):
         r = Report(state.code.upper(), state.name, "2026-01-01T00:00:00+00:00", served=True)
         if not ok:
             r.problems.append("200: expected a verified answer, got technical (X)")
@@ -68,16 +68,29 @@ def test_unknown_state_exits():
         cli.main(["check", "--state", "zz"])
 
 
-@pytest.mark.parametrize("bad", ["maybe", "2"])
-def test_all_cases_must_be_a_boolean(bad):
+@pytest.mark.parametrize("bad", ["many", "0", "21", "2.5"])
+def test_count_must_be_1_to_20(bad):
     with pytest.raises(SystemExit):
-        cli.main(["check", "--state", "az", "--all-cases", bad])
+        cli.main(["check", "--state", "az", "--count", bad])
+
+
+def test_check_passes_the_state_pool_and_count(monkeypatch):
+    monkeypatch.setenv("CHECKER_BASE_URL", "https://checker.invalid")
+    seen = {}
+
+    def run(self, state, pool, *, count=5):
+        seen.update(pool=pool, count=count)
+        return Report(state.code.upper(), state.name, "t", served=True)
+
+    monkeypatch.setattr(Checker, "run", run)
+    cli.main(["check", "--state", "or", "--count", "7"])
+    assert seen["count"] == 7 and len(seen["pool"].ids) == 200 and seen["pool"].active
 
 
 def test_check_redacts_the_host_from_report_summary_and_output(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("CHECKER_BASE_URL", "https://secret-host.invalid")
 
-    def run(self, state, *, all_cases=False):
+    def run(self, state, pool, *, count=5):
         r = Report(state.code.upper(), state.name, "t", served=True)
         r.problems.append(
             "no answer: certificate is not valid for 'secret-host.invalid' at https://secret-host.invalid"
@@ -260,3 +273,39 @@ def test_an_outcome_file_that_is_not_text_fails_the_state_without_crashing(tmp_p
     (tmp_path / "az" / "outcome.txt").write_bytes(b"\xff\xfe")
     result = batch.load(states.get("az"), tmp_path / "az")
     assert result.failed and "AZ Arizona" in batch.summary([result], "t")
+
+
+# pools
+
+
+def test_every_state_has_a_pool_of_200_distinct_ids_with_active_ones():
+    for s in states.STATES:
+        pool = pools.load(s)
+        assert len(pool.ids) == 200 == len(set(pool.ids)), s.code
+        assert len(pool.active) >= 50 and set(pool.active) <= set(pool.ids), s.code
+
+
+@pytest.mark.parametrize(
+    "text, why",
+    [
+        ("# c\n1 active\n1\n", "appears twice"),
+        ("1 active\nbad id\n", "not an entity id"),
+        ("1 active\n-x\n", "not an entity id"),
+        ("1\n2\n", "no id is marked active"),
+    ],
+)
+def test_a_bad_pool_file_is_refused(tmp_path, text, why):
+    (tmp_path / "az.txt").write_text(text)
+    with pytest.raises(SystemExit, match=why):
+        pools.load(states.get("az"), tmp_path)
+
+
+def test_a_pool_line_may_end_with_a_comment(tmp_path):
+    (tmp_path / "az.txt").write_text("# head\n1047374 active # verified 2026-11-03\n22  # inactive\n")
+    pool = pools.load(states.get("az"), tmp_path)
+    assert pool.ids == ("1047374", "22") and pool.active == ("1047374",)
+
+
+def test_a_missing_pool_is_refused(tmp_path):
+    with pytest.raises(SystemExit, match="no pool for AZ"):
+        pools.load(states.get("az"), tmp_path)

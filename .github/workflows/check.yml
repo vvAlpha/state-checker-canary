@@ -4,8 +4,9 @@
 #
 # - plan lists the batch's states from canary/states.py (all of them, or the
 #   ones a manual run names), so a new state gets its job without an edit here.
-# - Each state's job runs `python -m canary check`: live lookups of the state's
-#   sample ids through the deployed checker, then a storage round trip. It
+# - Each state's job runs `python -m canary check`: live lookups through the
+#   deployed checker of 5 entities drawn at random from the state's pool
+#   (pools/<code>.txt), then a storage round trip. It
 #   writes report.json, and is red on any problem. One state's failure never
 #   stops another's (fail-fast off), and no job waits on another state.
 # - The batch summary reads every state's report: one table for the batch, the
@@ -27,10 +28,10 @@ on:
         description: '"all", or state codes separated by commas (e.g. "oh,wa")'
         type: string
         default: all
-      all_cases:
-        description: Check every sample id, not just two per state
-        type: boolean
-        default: false
+      count:
+        description: Entities to look up per state, drawn at random from its pool (1 to 20)
+        type: string
+        default: "5"
 
 permissions: {}
 
@@ -96,8 +97,8 @@ jobs:
         env:
           CHECKER_BASE_URL: ${{ secrets.CHECKER_BASE_URL }}
           STATE: ${{ matrix.state.code }}
-          ALL_CASES: ${{ inputs.all_cases == true }}
-        run: python -m canary check --state "$STATE" --all-cases "$ALL_CASES" --json "out/$STATE/report.json"
+          COUNT: ${{ inputs.count || '5' }}
+        run: python -m canary check --state "$STATE" --count "$COUNT" --json "out/$STATE/report.json"
 
       - name: Record the outcome
         if: ${{ !cancelled() }}

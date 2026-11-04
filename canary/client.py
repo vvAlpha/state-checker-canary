@@ -49,9 +49,11 @@ class CheckerClient:
         self,
         base: str,
         *,
-        timeout: float = 45.0,
-        attempts: int = 3,
-        backoff: tuple[float, ...] = (5.0, 15.0),
+        # The checker answers within its 14 s deadline and nginx cuts at 25 s, so 30 s
+        # per request is generous; two attempts keep five lookups inside the budget.
+        timeout: float = 30.0,
+        attempts: int = 2,
+        backoff: tuple[float, ...] = (5.0,),
         opener: Callable = urllib.request.urlopen,
         sleep: Callable[[float], None] = time.sleep,
     ):
@@ -61,6 +63,8 @@ class CheckerClient:
         self.backoff = backoff
         self._open = opener
         self._sleep = sleep
+        # A time.monotonic() deadline set by the check: no retry starts after it.
+        self.deadline: float | None = None
 
     def lookup(self, state: str, eid: str, *, live: bool) -> Response:
         path = f"/api/v1/eligibility/{urllib.parse.quote(state, safe='')}/{urllib.parse.quote(eid, safe='')}"
@@ -74,6 +78,9 @@ class CheckerClient:
         for attempt in range(self.attempts):
             if attempt:
                 self._sleep(self.backoff[min(attempt - 1, len(self.backoff) - 1)])
+            if self.deadline is not None and time.monotonic() >= self.deadline:
+                # out of time: the failure so far, or "not started", is the answer
+                return last or Response(None, None, "not sent: the check's time budget ran out", 0.0)
             last = self._once(path)
             if last.ok or (last.status is not None and last.status not in RETRY_STATUSES and last.body is not None):
                 return last

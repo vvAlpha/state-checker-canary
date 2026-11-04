@@ -1,29 +1,27 @@
 """Check one state end to end through the deployed checker.
 
-1. Read the checker's configuration: the state's sample ids from its regression
-   pack, each with the answer it is expected to give, and whether it is served.
-   Whether it *should* be served is this repository's call (states.py), so a
-   checker that drops a state by mistake fails instead of excusing itself.
-2. Look up this run's samples live (`?live=true`: the checker scrapes the state's
-   registry now). Every answer must be well formed, say it was live, and give
-   the expected outcome: "verified" with a verdict, or "not_found" for an id that
-   does not exist.
+1. Read the checker's configuration: whether the state is served. Whether it
+   *should* be served is this repository's call (states.py), so a checker that
+   drops a state by mistake fails instead of excusing itself.
+2. Look up this batch's entities live (`?live=true`: the checker scrapes the
+   state's registry now). They are drawn at random from the state's pool
+   (pools/<code>.txt: ids the checker verified before), a few per batch with a
+   random pause between them, so no entity is looked up on a fixed rhythm and no
+   registry sees a burst. Every answer must be well formed, say it was live,
+   follow the checker's decision table, and be "verified".
 3. Round trip through storage: right after a live answer, a normal lookup must be
    served from storage (R2) with an observation this run produced, which proves
    answers are saved and read back.
 
 What fails the run (someone has to act):
-- the checker unreachable, or its configuration unreadable or short of samples;
+- the checker unreachable, or its configuration unreadable;
 - a state served or not served against what states.py says;
-- an answer that is malformed, not live when asked live, or has the wrong outcome;
-- the registry not answering, twice in a row;
+- an answer that is malformed, not live when asked live, or not verified (a
+  pool entity the checker cannot find, or a registry not answering twice);
 - storage not serving this run's answer back, or serving it back different;
 - the run's time budget running out, or the check itself crashing.
 
 What only warns (shown in the summary, the run stays green):
-- a verdict that moved (an entity filed or was dissolved since the pack was
-  recorded: the pack wants updating, the checker is working; the same rule as
-  the checker's own regression tool);
 - a state the checker is meant not to serve;
 - no answer in this run that storage would serve (inactive entities, and ones
   not open yet, are re-checked live by design).
@@ -31,13 +29,15 @@ What only warns (shown in the summary, the run stays green):
 
 from __future__ import annotations
 
+import random
 import time
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 
 from .client import CheckerClient, Response
-from .states import INTERVAL_HOURS, State
+from .pools import Pool
+from .states import State
 
 # A registry that did not answer gets one more try after this pause, so a
 # session being renewed or a proxy line resting does not page anyone.
@@ -45,6 +45,9 @@ RETRY_PAUSE_SECONDS = 60
 # R2 writes land 3 to 8 seconds after the answer (measured 2026-11-03, 25 states);
 # the round trip asks after the first pause, then after each later one.
 ROUND_TRIP_PAUSES = (15, 20, 30)
+# Entities per state per batch, and the random pause between their lookups.
+COUNT = 5
+SPACING_SECONDS = (5.0, 15.0)
 # The whole check stops starting new lookups after this, leaving the job time to
 # write the report and update the issue before its own timeout (30 minutes).
 BUDGET_SECONDS = 20 * 60
@@ -64,8 +67,6 @@ ACTION_FOR = {
 }  # fmt: skip
 CAN_FILE_ACTIONS = ("proceed", "proceed_with_warning")
 TRANSIENT_OUTCOMES = ("technical", "local")
-# Expected verdicts of active entities, which the checker serves from storage.
-ACTIVE_VERDICTS = ("eligible", "eligible_delinquent", "already_filed", "not_applicable")
 
 
 class OutOfTime(Exception):
@@ -83,7 +84,6 @@ class CaseResult:
     seconds: float | None = None
     attempts: int = 0
     problem: str | None = None
-    drift: str | None = None
     observation_id: str | None = None
     answer: dict | None = None  # the fields storage must serve back unchanged
     answered_at: float | None = None  # monotonic, when the live answer came back
@@ -109,43 +109,6 @@ class Report:
 
     def to_dict(self) -> dict:
         return {**asdict(self), "ok": self.ok}
-
-
-def slot(now: float) -> int:
-    """Which INTERVAL_HOURS-hour slot `now` falls in; picks the rotating sample."""
-    return int(now // (INTERVAL_HOURS * 3600))
-
-
-def plan(samples: list[dict], run_slot: int, all_cases: bool) -> list[dict]:
-    """This run's samples. The first is the round-trip candidate: the first sample
-    expected to be active (fixed, so every run tries a storage round trip). The
-    second rotates through the rest, one per run, so a day of runs covers all of
-    them. `all_cases` checks every sample."""
-    if not samples:
-        return []
-    anchor = next((s for s in samples if s["expect"] in ACTIVE_VERDICTS), None)
-    anchor = anchor or next((s for s in samples if s["expect"] == "unknown"), None)
-    anchor = anchor or next((s for s in samples if s["expect"] != "not_found"), samples[0])
-    rest = [s for s in samples if s is not anchor]
-    if all_cases:
-        return [anchor, *rest]
-    return [anchor, rest[run_slot % len(rest)]] if rest else [anchor]
-
-
-def samples_of(entry: dict) -> tuple[list[dict], str | None]:
-    """The entry's samples, or a problem: each needs a text id and a known expected
-    answer, and a served state needs at least one existing and one made-up id."""
-    raw = entry.get("samples")
-    if not isinstance(raw, list):
-        return [], "its sample list is missing or not a list"
-    samples = []
-    for s in raw:
-        if not (isinstance(s, dict) and isinstance(s.get("eid"), str) and s["eid"].strip()):
-            return [], f"a sample has no usable id: {str(s)[:80]}"
-        if s.get("expect") not in VERDICTS | {"not_found"}:
-            return [], f"sample {s['eid']} expects {s.get('expect')!r}, not a known answer"
-        samples.append({"eid": s["eid"], "expect": s["expect"]})
-    return samples, None
 
 
 def _error(r: Response) -> str:
@@ -197,14 +160,11 @@ def _storable(body: dict) -> bool:
     return body.get("outcome") == "verified" and body.get("is_active") is True and body.get("verdict") != "not_yet_open"
 
 
-def judge(expect: str, body: dict) -> tuple[str | None, str | None]:
-    """(problem, drift) for one well-formed answer."""
-    outcome, verdict = body["outcome"], body["verdict"]
-    if expect == "not_found":
-        return (None if outcome == "not_found" else f"expected not found, got {outcome} ({verdict})"), None
-    if outcome != "verified":
-        return f"expected a verified answer, got {outcome} ({body.get('reason')})", None
-    return None, (f"verdict {expect} -> {verdict}" if verdict != expect else None)
+def judge(body: dict) -> str | None:
+    """The problem with one well-formed answer for a pool entity, or None."""
+    if body["outcome"] != "verified":
+        return f"expected a verified answer, got {body['outcome']} ({body.get('reason')})"
+    return None
 
 
 class Checker:
@@ -216,20 +176,24 @@ class Checker:
         clock: Callable[[], float] = time.monotonic,
         wall: Callable[[], float] = time.time,
         budget: float = BUDGET_SECONDS,
+        rng: random.Random | None = None,
     ):
         self.client = client
+        self.rng = rng or random.SystemRandom()
         self.sleep = sleep
         self.clock = clock
         self.wall = wall
         self.budget = budget
         self._deadline = 0.0
 
-    def run(self, state: State, *, all_cases: bool = False) -> Report:
+    def run(self, state: State, pool: Pool, *, count: int = COUNT) -> Report:
         """Never raises: whatever goes wrong becomes a problem in the report."""
         report = Report(state.code.upper(), state.name, _iso(self.wall()))
         self._deadline = self.clock() + self.budget
+        if isinstance(self.client, CheckerClient):
+            self.client.deadline = time.monotonic() + self.budget
         try:
-            self._run(state, report, all_cases)
+            self._run(state, report, pool, count)
         except OutOfTime as e:
             report.problems.append(f"stopped: the check's {round(self.budget / 60)}-minute budget ran out before {e}")
         except Exception as e:  # noqa: BLE001  reported as a failure, never lost
@@ -241,7 +205,7 @@ class Checker:
         if self.clock() >= self._deadline:
             raise OutOfTime(before)
 
-    def _run(self, state: State, report: Report, all_cases: bool) -> None:
+    def _run(self, state: State, report: Report, pool: Pool, count: int) -> None:
         cfg = self.client.config()
         if not cfg.ok:
             report.problems.append(f"the checker's configuration could not be read: {_error(cfg)}")
@@ -266,59 +230,50 @@ class Checker:
                 f"but it should be {want} (canary/states.py)"
             )
             return
-        samples, bad = samples_of(entry)
-        if bad:
-            report.problems.append(f"the configuration's samples for {report.state} are unusable: {bad}")
-            return
-        made_up = any(s["expect"] == "not_found" for s in samples)
-        storable = any(s["expect"] in (*ACTIVE_VERDICTS, "unknown") for s in samples)
-        if state.served and not (made_up and storable):
+        if len(pool.ids) < count or not pool.active:
             report.problems.append(
-                f"the configuration needs a made-up sample id and one expected active (or unknown) "
-                f"for {report.state}, to check not-found answers and storage"
+                f"the pool for {report.state} has {len(pool.ids)} ids ({len(pool.active)} active); "
+                f"a batch needs {count}, one of them active"
             )
             return
-        if not samples:
-            report.problems.append(f"the checker's configuration has no sample ids for {report.state}")
-            return
-        cases = plan(samples, slot(self.wall()), all_cases)
+        # One that was active, so storage should serve it (the round trip), then the
+        # rest from the whole pool; all at random.
+        first = self.rng.choice(pool.active)
+        picked = [first, *self.rng.sample([i for i in pool.ids if i != first], count - 1)]
         if not state.served:
-            self._not_served(state, report, cases[0])
+            self._not_served(state, report, picked[0])
             return
-        for case in cases:
-            self._time(f"checking {case['eid']}")
-            report.cases.append(self._case(state, case))
-        for c in report.cases:
-            if c.problem:
-                report.problems.append(f"{c.eid}: {c.problem}")
-            if c.drift:
-                report.warnings.append(f"{c.eid}: {c.drift} (the regression pack wants updating)")
+        for i, eid in enumerate(picked):
+            if i:
+                self.sleep(self.rng.uniform(*SPACING_SECONDS))
+            self._time(f"checking {eid}")
+            report.cases.append(self._case(state, eid))
+        report.problems += [f"{c.eid}: {c.problem}" for c in report.cases if c.problem]
         self._round_trip(state, report)
 
-    def _not_served(self, state: State, report: Report, case: dict) -> None:
-        r = self.client.lookup(state.code, case["eid"], live=False)
-        result = CaseResult(case["eid"], "unsupported", seconds=r.seconds, attempts=1)
+    def _not_served(self, state: State, report: Report, eid: str) -> None:
+        self._time(f"checking {eid}")
+        r = self.client.lookup(state.code, eid, live=False)
+        result = CaseResult(eid, "unsupported", seconds=r.seconds, attempts=1)
         report.cases.append(result)
         if not r.ok:
-            report.problems.append(f"{case['eid']}: no answer from the checker: {_error(r)}")
+            report.problems.append(f"{eid}: no answer from the checker: {_error(r)}")
             return
         result.outcome, result.verdict = r.body.get("outcome"), r.body.get("verdict")
         if result.outcome != "unsupported":
-            report.problems.append(
-                f"{case['eid']}: {report.state} should not be served, but it answered as {result.outcome}"
-            )
+            report.problems.append(f"{eid}: {report.state} should not be served, but it answered as {result.outcome}")
             return
         note = f": {report.checker_note}" if report.checker_note else ""
         report.warnings.append(f"{report.state} is not served by the checker{note}")
 
-    def _case(self, state: State, case: dict) -> CaseResult:
-        result = CaseResult(case["eid"], case["expect"])
+    def _case(self, state: State, eid: str) -> CaseResult:
+        result = CaseResult(eid, "verified")
         for attempt in (1, 2):
             if attempt == 2:
-                self._time(f"retrying {case['eid']}")
                 self.sleep(RETRY_PAUSE_SECONDS)
+                self._time(f"retrying {eid}")
             result.attempts = attempt
-            r = self.client.lookup(state.code, case["eid"], live=True)
+            r = self.client.lookup(state.code, eid, live=True)
             result.seconds = r.seconds
             result.outcome = result.verdict = result.reason = result.observation_id = result.is_active = None
             result.answer = result.answered_at = None
@@ -326,7 +281,7 @@ class Checker:
                 result.problem = f"no answer from the checker: {_error(r)}"
                 continue
             body = r.body
-            bad = malformed(body, state, case["eid"], basis="live")
+            bad = malformed(body, state, eid, basis="live")
             if bad:
                 result.problem = f"a malformed answer: {bad}"
                 return result
@@ -336,7 +291,7 @@ class Checker:
             if result.outcome in TRANSIENT_OUTCOMES:
                 result.problem = f"the registry did not answer ({result.reason}), twice"
                 continue
-            result.problem, result.drift = judge(case["expect"], body)
+            result.problem = judge(body)
             return result
         return result
 
@@ -363,18 +318,40 @@ class Checker:
         trip: dict = {"checked": True, "eid": live.eid, "observation_id": live.observation_id, "tries": []}
         report.round_trip = trip
 
-        def adopt(r: Response, started: float, *, read_back: bool) -> None:
+        def take_live(r: Response, started: float, what: str, *, read_back: bool) -> bool:
+            """Judge a live answer met during the round trip (a probe that missed storage,
+            or a refresh). False ends the round trip: failed, or inconclusive when the
+            entity changed into an answer storage never serves. A verified answer joins
+            this run's observations; a transient failure is just a missed try."""
             nonlocal asked, extra_reads
-            if r.ok and not malformed(r.body, state, live.eid, basis="live") and r.body["outcome"] == "verified":
-                ours[r.body["observation_id"]] = _answer(r.body)
-                asked = started
-                if read_back and not pauses and extra_reads:
-                    extra_reads -= 1
-                    pauses.append(ROUND_TRIP_PAUSES[-1])
+            if not r.ok:
+                return True
+            body = r.body
+            bad = malformed(body, state, live.eid, basis="live")
+            if bad or body["outcome"] not in ("verified", *TRANSIENT_OUTCOMES):
+                why = f"a malformed answer: {bad}" if bad else f"the answer {body['outcome']}"
+                report.problems.append(f"{live.eid}: a {what} got {why}")
+                trip["passed"] = False
+                return False
+            if body["outcome"] != "verified":
+                return True
+            if not _storable(body):
+                trip["passed"] = None
+                report.warnings.append(
+                    f"storage round trip inconclusive: {live.eid} now answers {body['verdict']} "
+                    f"(active {body['is_active']}), which the checker re-checks live"
+                )
+                return False
+            ours[body["observation_id"]] = _answer(body)
+            asked = started
+            if read_back and not pauses and extra_reads:
+                extra_reads -= 1
+                pauses.append(ROUND_TRIP_PAUSES[-1])
+            return True
 
         while pauses:
-            self._time(f"the storage round trip for {live.eid}")
             self.sleep(pauses.pop(0))
+            self._time(f"the storage round trip for {live.eid}")
             started = self.clock()
             r = self.client.lookup(state.code, live.eid, live=False)
             body = r.body if r.ok else {}
@@ -385,22 +362,18 @@ class Checker:
             if not r.ok:
                 continue
             if body.get("basis") == "live":
-                fine = not malformed(body, state, live.eid, basis="live")
-                if fine and body["outcome"] == "verified" and not _storable(body):
-                    # The entity changed (dissolved, say) into an answer storage never serves.
-                    trip["passed"] = None
-                    report.warnings.append(
-                        f"storage round trip inconclusive: {live.eid} now answers {body['verdict']} "
-                        f"(active {body['is_active']}), which the checker re-checks live"
-                    )
-                    return
                 # Missed storage and asked the registry, which saves a newer one. No
                 # extra read for it: probes that keep missing storage mean R2 is failing.
-                adopt(r, started, read_back=False)
+                if not take_live(r, started, "storage probe", read_back=False):
+                    return
                 continue
             bad = malformed(body, state, live.eid, basis="store")
             if bad:
                 report.problems.append(f"{live.eid}: storage gave a malformed answer: {bad}")
+                trip["passed"] = False
+                return
+            if body["outcome"] != "verified":
+                report.problems.append(f"{live.eid}: storage served an unverified answer ({body['outcome']})")
                 trip["passed"] = False
                 return
             stored_id, age = body["observation_id"], body.get("age_seconds")
@@ -410,11 +383,15 @@ class Checker:
                 return
             if stored_id not in ours:
                 # Possibly fetched after ours: another run (a branch test, a user) saved
-                # over it. Ask live once more, so storage gets one of ours again.
+                # over it. Ask live once more, so storage gets one of ours again. It may
+                # even be inactive: the checker serves a stored inactive answer when its
+                # live re-check fails, by design, so that alone proves nothing wrong.
                 if age < self.clock() - asked:
                     self._time(f"the storage round trip for {live.eid}")
                     started = self.clock()
-                    adopt(self.client.lookup(state.code, live.eid, live=True), started, read_back=True)
+                    again = self.client.lookup(state.code, live.eid, live=True)
+                    if not take_live(again, started, "live refresh", read_back=True):
+                        return
                 continue  # otherwise an older one: this run's has not landed yet
             stored, saved = _answer(body), ours[stored_id]
             changed = [f"{k} {saved[k]} -> {stored[k]}" for k in saved if stored[k] != saved[k]]
@@ -447,7 +424,7 @@ def markdown(report: Report, run_url: str | None = None) -> str:
             "|---|---|---|---|---|---|---|---|",
         ]
     for c in report.cases:
-        result = f"❌ {c.problem}" if c.problem else (f"⚠️ {c.drift}" if c.drift else "✅")
+        result = f"❌ {c.problem}" if c.problem else "✅"
         seconds = c.seconds if c.seconds is not None else ""
         lines.append(
             f"| `{_cell(c.eid)}` | {_cell(c.expect)} | {_cell(c.outcome)} | {_cell(c.verdict)} | "

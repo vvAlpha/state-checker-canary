@@ -69,16 +69,16 @@ def test_ok_json_object():
     assert r.ok and r.status == 200 and r.body == {"a": 1}
 
 
-def test_retries_transport_failures_then_succeeds():
-    op = opener_of(urllib.error.URLError("refused"), http_error(503), FakeResp(200, b"{}"))
+def test_retries_a_transport_failure_then_succeeds():
+    op = opener_of(urllib.error.URLError("refused"), FakeResp(200, b"{}"))
     r = client(op).get("/x")
-    assert r.ok and len(op.calls) == 3
+    assert r.ok and len(op.calls) == 2
 
 
-def test_gives_up_after_three_attempts():
-    op = opener_of(http_error(429))
+def test_gives_up_after_two_attempts():
+    op = opener_of(http_error(429), http_error(503))
     r = client(op).get("/x")
-    assert not r.ok and r.status == 429 and len(op.calls) == 3
+    assert not r.ok and r.status == 503 and len(op.calls) == 2
 
 
 def test_a_json_404_is_an_answer_not_retried():
@@ -95,3 +95,24 @@ def test_non_json_and_non_object_bodies_are_errors():
 def test_timeout_is_an_error_without_status():
     r = client(opener_of(TimeoutError("slow"))).get("/x")
     assert r.status is None and r.error.startswith("no answer: TimeoutError")
+
+
+def test_no_retry_starts_after_the_deadline():
+    import time
+
+    op = opener_of(urllib.error.URLError("refused"), FakeResp(200, b"{}"))
+    c = client(op)
+    c.deadline = time.monotonic() + 60
+    c._sleep = lambda s: setattr(c, "deadline", time.monotonic() - 1)  # the backoff crosses the deadline
+    r = c.get("/x")
+    assert not r.ok and r.error.startswith("no answer") and len(op.calls) == 1
+
+
+def test_no_first_attempt_after_the_deadline():
+    import time
+
+    op = opener_of(FakeResp(200, b"{}"))
+    c = client(op)
+    c.deadline = time.monotonic() - 1
+    r = c.get("/x")
+    assert op.calls == [] and r.error == "not sent: the check's time budget ran out"

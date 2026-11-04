@@ -5,18 +5,38 @@ import json
 import pytest
 
 from canary import states
-from canary.check import RETRY_PAUSE_SECONDS, Checker, malformed, markdown, plan, slot
+from canary.check import RETRY_PAUSE_SECONDS, SPACING_SECONDS, Checker, malformed, markdown
 from canary.client import Response
-from tests.fakes import SAMPLES, Clock, FakeClient, answer, config
+from canary.pools import Pool
+from tests.fakes import Clock, FakeClient, answer, config
 
 AZ = states.get("az")
 IN = states.get("in")
 
 
-def run(client, all_cases=False, clock=None, state=AZ, budget=1200):
+POOL = Pool(("200", "100", "300", "400", "500"), active=("200",))
+
+
+class FirstPicks:
+    """A stand-in for the random source: picks the pool's first ids, shortest pause."""
+
+    def __init__(self):
+        self.picked = []
+
+    def choice(self, seq):
+        return seq[0]
+
+    def sample(self, pool, k):
+        return list(pool[:k])
+
+    def uniform(self, low, high):
+        return low
+
+
+def run(client, count=2, clock=None, state=AZ, budget=1200, pool=POOL):
     clock = clock or Clock(wall=0)
-    checker = Checker(client, sleep=clock.sleep, clock=clock.clock, wall=clock.wall, budget=budget)
-    return checker.run(state, all_cases=all_cases), clock
+    checker = Checker(client, sleep=clock.sleep, clock=clock.clock, wall=clock.wall, budget=budget, rng=FirstPicks())
+    return checker.run(state, pool, count=count), clock
 
 
 def _healthy(rotating_eid="100", rotating=None):
@@ -27,26 +47,46 @@ def _healthy(rotating_eid="100", rotating=None):
     }
 
 
-# planning
+# picking
 
 
-def test_plan_anchors_on_the_first_active_sample_and_rotates_the_rest():
-    picked = [plan(SAMPLES, s, False) for s in range(3)]
-    assert all(p[0]["eid"] == "200" for p in picked)  # "eligible": the first active expectation
-    assert [p[1]["eid"] for p in picked] == ["100", "300", "999"]
-    assert [s["eid"] for s in plan(SAMPLES, 0, True)] == ["200", "100", "300", "999"]
+def test_each_batch_draws_a_fresh_random_set_from_the_pool():
+    import random
+
+    pool = [str(n) for n in range(200)]
+    picks = set()
+    for seed in range(20):
+        rng = random.Random(seed)
+        chosen = rng.sample(pool, 5)
+        assert len(set(chosen)) == 5 and set(chosen) <= set(pool)
+        picks.add(tuple(chosen))
+    assert len(picks) == 20  # no fixed rhythm
 
 
-def test_plan_falls_back_when_no_sample_is_expected_active():
-    samples = [{"eid": "9", "expect": "not_found"}, {"eid": "1", "expect": "dead"}]
-    assert plan(samples, 0, False)[0]["eid"] == "1"
-    assert plan([{"eid": "9", "expect": "not_found"}], 5, False) == [{"eid": "9", "expect": "not_found"}]
-    assert plan([], 0, False) == []
+def test_lookups_are_spaced_by_a_random_pause():
+    answers = {(e, True): [answer(verdict="dead", active=False, obs=f"o{e}")] for e in POOL.ids}
+    answers[("200", True)] = [answer(obs="live1")]
+    answers[("200", False)] = [answer(basis="store", age=9, obs="live1")]
+    report, clock = run(FakeClient(config(), answers), count=5)
+    assert report.ok, report.problems
+    assert [c.eid for c in report.cases] == list(POOL.ids)
+    assert clock.slept.count(SPACING_SECONDS[0]) == 4  # between the 5 lookups
 
 
-def test_slot_changes_every_three_hours():
-    assert slot(0) == slot(3 * 3600 - 1) == 0
-    assert slot(3 * 3600) == 1
+def test_a_pool_smaller_than_the_count_fails():
+    report, _ = run(FakeClient(config(), {}), count=5, pool=Pool(("1", "2"), ("1",)))
+    assert report.problems == ["the pool for AZ has 2 ids (1 active); a batch needs 5, one of them active"]
+
+
+def test_the_first_pick_is_an_active_id_and_never_repeats():
+    import random
+
+    pool = Pool(tuple(str(n) for n in range(200)), active=("7", "9"))
+    for seed in range(50):
+        checker = Checker(FakeClient(config(), {}), rng=random.Random(seed))
+        first = checker.rng.choice(pool.active)
+        rest = checker.rng.sample([i for i in pool.ids if i != first], 4)
+        assert first in pool.active and first not in rest and len(set(rest)) == 4
 
 
 # healthy runs and policy
@@ -57,26 +97,17 @@ def test_a_healthy_state_passes_with_a_round_trip():
     assert report.ok, report.problems
     assert report.round_trip["passed"] is True
     assert [c.eid for c in report.cases] == ["200", "100"]
-    assert clock.slept == [15]  # the first round-trip pause, no retries
+    assert clock.slept == [SPACING_SECONDS[0], 15]  # the spacing pause, the first round-trip pause
 
 
-def test_verdict_drift_warns_but_passes():
-    report, _ = run(FakeClient(config(), _healthy(rotating=answer(verdict="eligible", obs="x"))))
-    assert report.ok
-    assert any("dead -> eligible" in w for w in report.warnings)
+def test_any_verified_verdict_passes():
+    report, _ = run(FakeClient(config(), _healthy(rotating=answer(verdict="already_filed", obs="x"))))
+    assert report.ok and not report.warnings
 
 
-def test_a_wrong_outcome_fails():
+def test_a_pool_entity_the_checker_cannot_find_fails():
     report, _ = run(FakeClient(config(), _healthy(rotating=answer(outcome="not_found", verdict="unknown"))))
     assert any(p.startswith("100: expected a verified answer, got not_found") for p in report.problems)
-
-
-def test_not_found_expected_and_given_passes():
-    clock = Clock(wall=2 * 3 * 3600)  # slot 2: the rotating pick is "999"
-    answers = _healthy(rotating_eid="999", rotating=answer(outcome="not_found", verdict="unknown"))
-    report, _ = run(FakeClient(config(), answers), clock=clock)
-    assert report.ok, report.problems
-    assert report.cases[1].eid == "999"
 
 
 def test_a_registry_that_misses_once_is_retried_and_passes():
@@ -223,22 +254,6 @@ def test_a_served_state_reported_not_served_fails():
 def test_a_served_flag_that_is_not_boolean_fails():
     report, _ = run(FakeClient({"states": [{**config()["states"][0], "served": "yes"}]}, {}))
     assert "served flag is 'yes'" in report.problems[0]
-
-
-@pytest.mark.parametrize(
-    "samples, why",
-    [
-        ([], "needs a made-up sample id and one expected active"),
-        ([{"eid": "1", "expect": "eligible"}], "needs a made-up sample id and one expected active"),
-        ([{"eid": "1", "expect": "dead"}, {"eid": "9", "expect": "not_found"}], "one expected active (or unknown)"),
-        ([{"eid": "1", "expect": "dead"}, {"eid": "2", "expect": "maybe"}], "expects 'maybe'"),
-        ([{"eid": "", "expect": "dead"}, {"eid": "9", "expect": "not_found"}], "no usable id"),
-        ("nope", "missing or not a list"),
-    ],
-)
-def test_unusable_samples_fail(samples, why):
-    report, _ = run(FakeClient(config(samples=samples), {}))
-    assert any(why in p for p in report.problems), report.problems
 
 
 def test_a_state_meant_not_to_be_served_passes_with_a_warning():
@@ -392,3 +407,97 @@ def test_a_probe_that_gets_no_registry_answer_is_not_inconclusive():
     assert not report.ok
     assert report.round_trip["passed"] is False
     assert not any("inconclusive" in w for w in report.warnings)
+
+
+def test_round_trip_fails_when_storage_serves_an_unverified_answer():
+    answers = _healthy()
+    stored = {**answer(outcome="technical", verdict="eligible", basis="store", age=9), "observation_id": "live1"}
+    answers[("200", False)] = [stored]
+    report, _ = run(FakeClient(config(), answers))
+    assert report.round_trip["passed"] is False
+    assert any("storage served an unverified answer (technical)" in p for p in report.problems)
+
+
+def test_round_trip_fails_on_a_malformed_live_answer_to_a_probe():
+    answers = _healthy()
+    answers[("200", False)] = [{**answer(obs="x"), "entity_id": "other"}, answer(basis="store", age=9, obs="live1")]
+    report, _ = run(FakeClient(config(), answers))
+    assert report.round_trip["passed"] is False
+    assert any("a storage probe got a malformed answer" in p for p in report.problems)
+
+
+def test_no_lookup_starts_after_the_budget_ran_out_during_a_pause():
+    answers = _healthy()
+    answers[("100", True)] = [
+        answer(outcome="technical", verdict="unknown", reason="T"),
+        answer(verdict="dead", active=False),
+    ]
+    client = FakeClient(config(), answers)
+    report, _ = run(client, budget=RETRY_PAUSE_SECONDS - 1)  # the retry pause crosses the deadline
+    assert any("budget ran out before retrying 100" in p for p in report.problems)
+    assert client.calls.count(("az", "100", True)) == 1
+
+
+def test_round_trip_fails_on_a_malformed_live_refresh():
+    answers = _healthy()
+    answers[("200", True)] = [answer(obs="live1"), {**answer(obs="live3"), "entity_id": "other"}]
+    answers[("200", False)] = [answer(basis="store", age=2, obs="theirs"), answer(basis="store", age=5, obs="live1")]
+    report, _ = run(FakeClient(config(), answers))
+    assert report.round_trip["passed"] is False
+    assert any("a live refresh got a malformed answer" in p for p in report.problems)
+
+
+def test_round_trip_fails_when_a_probe_cannot_find_the_entity():
+    answers = _healthy()
+    answers[("200", False)] = [
+        answer(outcome="not_found", verdict="unknown"),
+        answer(basis="store", age=9, obs="live1"),
+    ]
+    report, _ = run(FakeClient(config(), answers))
+    assert report.round_trip["passed"] is False
+    assert any("a storage probe got the answer not_found" in p for p in report.problems)
+
+
+def test_round_trip_fails_when_a_refresh_cannot_find_the_entity():
+    answers = _healthy()
+    answers[("200", True)] = [answer(obs="live1"), answer(outcome="not_found", verdict="unknown")]
+    answers[("200", False)] = [answer(basis="store", age=2, obs="theirs"), answer(basis="store", age=5, obs="live1")]
+    report, _ = run(FakeClient(config(), answers))
+    assert any("a live refresh got the answer not_found" in p for p in report.problems)
+
+
+def test_a_not_served_lookup_does_not_start_after_the_budget():
+    client = FakeClient(
+        config(state="in", served=False), {("200", False): [answer(outcome="unsupported", verdict="unknown")]}
+    )
+    report, _ = run(client, state=IN, budget=0)
+    assert client.calls == [] and any("budget ran out" in p for p in report.problems)
+
+
+@pytest.mark.parametrize("where", ["probe", "refresh"])
+def test_an_unsupported_answer_during_the_round_trip_fails(where):
+    answers = _healthy()
+    unsupported = answer(outcome="unsupported", verdict="unknown")
+    if where == "probe":
+        answers[("200", False)] = [unsupported, answer(basis="store", age=9, obs="live1")]
+    else:
+        answers[("200", True)] = [answer(obs="live1"), unsupported]
+        answers[("200", False)] = [
+            answer(basis="store", age=2, obs="theirs"),
+            answer(basis="store", age=5, obs="live1"),
+        ]
+    report, _ = run(FakeClient(config(), answers))
+    assert report.round_trip["passed"] is False
+    assert any("unsupported" in p for p in report.problems)
+
+
+def test_a_refresh_that_turns_unstorable_is_inconclusive_not_adopted():
+    answers = _healthy()
+    answers[("200", True)] = [answer(obs="live1"), answer(verdict="dead", active=False, obs="live3")]
+    answers[("200", False)] = [
+        answer(basis="store", age=2, obs="theirs"),
+        answer(verdict="dead", active=False, basis="store", age=5, obs="live3"),
+    ]
+    report, _ = run(FakeClient(config(), answers))
+    assert report.round_trip["passed"] is None
+    assert any("inconclusive" in w for w in report.warnings)
